@@ -1,0 +1,20 @@
+{
+  "balance_sol": 72.5,
+  "realized_pnl_sol": 0.0,
+  "open_positions": {
+    "9ndJDvDYQyBDx7KBH3hvp47oCUafAdUEb8xP1ERehmVx": {
+      "symbol": "SOLANA/SOL",
+      "entry_price": 9.145e-05,
+      "highest_price": 9.145e-05,
+      "invest_sol": 2.5,
+      "opened_ts": 1756690009.1086893
+    }
+  },
+  "last_buy_time": 1756690009.108691,
+  "last_global": 1756690009.1086912,
+  "telegram_offset": 0,
+  "paused": false,
+  "backoff": 0,
+  "_diag": {},
+  "_seen_social_mints": {}
+}
