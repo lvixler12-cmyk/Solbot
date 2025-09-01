@@ -66,22 +66,22 @@ STATE_FILE    = "state.json"
 
 DEFAULT_SETTINGS = {
     # ---------- Base Filter conditions (evaluated with a logic mode) ----------
-    "min_liq": 5000,                   # USD liquidity
-    "min_vol_usd": 500,                # USD volume threshold on window
-    "vol_window_min": 10,              # volume window in minutes (5..60)
-    "cap_range": [10000, 5_000_000],   # FDV band (USD)
+    "min_liq": 2000,                   # USD liquidity (lower for meme tokens)
+    "min_vol_usd": 200,                # USD volume threshold on window (lower for new tokens)
+    "vol_window_min": 5,               # volume window in minutes (shorter for faster detection)
+    "cap_range": [5000, 2_000_000],    # FDV band (USD) - better meme range
     "enforce_cap": True,               # include cap condition in base filter
     "pass_if_cap_unknown": True,       # unknown FDV counts as cap_ok
 
     # ---------- Filter Logic Mode ----------
     # Modes: "OR", "AND", "MAJORITY", "HYBRID"
-    "filter_mode": "OR",
+    "filter_mode": "HYBRID",           # Use HYBRID for better new token detection
     # For MAJORITY/HYBRID fallback: how many of {liq, vol, cap} must be true
-    "min_true": 2,
+    "min_true": 1,                     # More lenient for new tokens
     # HYBRID: if pair age ≤ hybrid_new_age_min, require liq AND vol; else MAJORITY(min_true)
-    "hybrid_new_age_min": 3,
+    "hybrid_new_age_min": 5,           # Very new tokens get stricter checks
 
-    # ---------- Solana MEME focus (simplified, not over-restrictive) ----------
+    # ---------- Solana MEME focus ----------
     "solana_only": True,                                # only consider chainId == 'solana'
     "meme_only": True,                                  # apply meme candidate checks
     "meme_quote_whitelist": ["SOL", "USDC", "USDT"],    # acceptable quote tokens
@@ -89,11 +89,11 @@ DEFAULT_SETTINGS = {
 
     # ---------- Launch Snipe ----------
     "launch_enabled": True,
-    "allowed_dex_ids": ["raydium", "pump", "meteora", "bunk"],  # key words found in dexId or url
-    "max_pair_age_min": 8,              # pair must be ≤ N minutes old
-    "launch_liq_min": 1500,             # min liq for launch snipe path
-    "launch_min_buys_m5": 3,            # buys in last 5m for early traction
-    "launch_require_2x": True,          # also require 2x predictor on launch path
+    "allowed_dex_ids": ["raydium", "pump", "meteora", "bunk", "jupiter"],  # added jupiter
+    "max_pair_age_min": 15,             # pair must be ≤ N minutes old (increased to catch more)
+    "launch_liq_min": 800,              # min liq for launch snipe path (lower for new memes)
+    "launch_min_buys_m5": 2,            # buys in last 5m for early traction (lower threshold)
+    "launch_require_2x": False,         # disable 2x requirement for launch to catch more early
 
     # ---------- RugCheck Gate ----------
     # Modes: "off" | "lenient" | "strict"
@@ -156,8 +156,8 @@ DEFAULT_SETTINGS = {
     "min_hold_sec": 5,         # minimum hold time is 5 seconds
 
     # ---------- Loop timing ----------
-    "poll_sec": 10,            # faster polling to catch newborns quickly
-    "social_poll_sec": 20,
+    "poll_sec": 5,             # very fast polling to catch newborns quickly
+    "social_poll_sec": 15,
 
     # ---------- Network backoff (Dexscreener) ----------
     "min_backoff": 2,
@@ -229,6 +229,7 @@ def safe_float(x, default=0.0) -> float:
 # === Dexscreener Fetch ==
 # =========================
 DEX_URLS = [
+    "https://api.dexscreener.com/latest/dex/pairs/solana",  # Get all Solana pairs
     "https://api.dexscreener.com/latest/dex/search?q=chain:solana",
     "https://api.dexscreener.com/latest/dex/search?q=solana",
     "https://api.dexscreener.com/latest/dex/search?q=SOL"
@@ -338,11 +339,12 @@ def is_solana_pair(p: dict) -> bool:
 
 def is_meme_candidate(p: dict) -> Tuple[bool, str]:
     """
-    Simplified, non-restrictive meme gate:
+    Strict meme token filtering for new SPL tokens:
       • must be Solana (if solana_only)
-      • quote must be in whitelist (SOL/USDC/USDT)
-      • base must NOT be in majors blacklist
-    No mint/ticker-length/age requirements here to avoid over-filtering.
+      • quote must be in whitelist (SOL/USDC/USDT) - these are the "major" tokens
+      • base must NOT be in majors blacklist - the base should be the NEW meme token
+      • base should NOT be any major token (prevent SOL/ETH, SOL/BTC type pairs)
+      • prefer tokens with reasonable market caps for memes (10k-5M range)
     """
     if settings.get("solana_only", True) and not is_solana_pair(p):
         return False, "not solana"
@@ -354,11 +356,31 @@ def is_meme_candidate(p: dict) -> Tuple[bool, str]:
     b_sym = (bt.get("symbol") or "").upper()
     q_sym = (qt.get("symbol") or "").upper()
 
+    # Quote must be a major stable token (SOL, USDC, USDT)
     if q_sym not in settings.get("meme_quote_whitelist", ["SOL","USDC","USDT"]):
         return False, f"bad quote {q_sym}"
-    if b_sym in settings.get("meme_base_blacklist", []):
-        return False, f"blacklisted base {b_sym}"
-    return True, "ok"
+    
+    # Base must NOT be any major token (this prevents SOL/ETH, SOL/BTC, etc.)
+    major_tokens = settings.get("meme_base_blacklist", []) + ["ETH", "BTC", "WETH", "WBTC", "MATIC", "AVAX", "FTM", "ATOM", "DOT", "ADA", "LINK", "UNI", "AAVE"]
+    if b_sym in [token.upper() for token in major_tokens]:
+        return False, f"blacklisted major base {b_sym}"
+    
+    # Additional checks for meme characteristics
+    # Check if base token has a reasonable name length (meme tokens usually have 3-10 char symbols)
+    if len(b_sym) < 2 or len(b_sym) > 12:
+        return False, f"unusual symbol length {b_sym}"
+    
+    # Check market cap is in meme range if available
+    fdv = safe_float(p.get("fdv"), -1)
+    if fdv <= 0:
+        fdv = safe_float(p.get("marketCap"), -1)
+    
+    if fdv > 0:
+        # Meme tokens typically have market caps between 10k and 50M
+        if fdv < 1000 or fdv > 50_000_000:
+            return False, f"market cap {fdv:,.0f} outside meme range"
+    
+    return True, "meme candidate ok"
 
 # =========================
 # === Base Filter Logic ==
@@ -535,10 +557,27 @@ def is_new_pair(p: dict) -> bool:
 def basic_launch_checks(p: dict) -> Tuple[bool, str]:
     liq = safe_float((p.get("liquidity") or {}).get("usd"), 0.0)
     buys = safe_float(((p.get("txns") or {}).get("m5") or {}).get("buys"), 0.0)
-    if liq < float(settings.get("launch_liq_min", 1500)):
-        return False, f"launch: liq {liq:.0f} < min"
-    if buys < float(settings.get("launch_min_buys_m5", 3)):
-        return False, f"launch: buys m5 {buys:.0f} < min"
+    sells = safe_float(((p.get("txns") or {}).get("m5") or {}).get("sells"), 0.0)
+    
+    # More lenient liquidity check for very new tokens (some may start with lower liq)
+    min_liq = float(settings.get("launch_liq_min", 1500))
+    if liq < min_liq:
+        # For very new pairs (< 5 minutes), be more lenient on liquidity
+        age_min = _age_minutes(p)
+        if age_min <= 5 and liq >= (min_liq * 0.3):  # 30% of min liq for very new pairs
+            pass  # Allow it
+        else:
+            return False, f"launch: liq {liq:.0f} < min {min_liq:.0f}"
+    
+    # Check for early buying activity (sign of interest)
+    min_buys = float(settings.get("launch_min_buys_m5", 3))
+    if buys < min_buys:
+        return False, f"launch: buys m5 {buys:.0f} < min {min_buys:.0f}"
+    
+    # Check buy/sell ratio is healthy (more buyers than sellers)
+    if sells > 0 and buys / (sells + 1) < 1.2:  # At least 20% more buys than sells
+        return False, f"launch: unhealthy buy/sell ratio {buys:.0f}/{sells:.0f}"
+    
     return True, "launch: basics ok"
 
 def _maybe_rugcheck(p: dict) -> Tuple[bool, str]:
@@ -897,6 +936,7 @@ HELP_TEXT = (
 "/panel – show control buttons\n"
 "/closeall – close all open positions at current market\n"
 "/ping – check bot responsiveness\n"
+"/testpairs – debug: show sample pairs being processed\n"
 )
 
 def panel_markup(paused: bool) -> dict:
@@ -1254,6 +1294,29 @@ def handle_text(msg: str) -> None:
 
     elif cmd == "/ping":
         tg_send("pong 🟩")
+    
+    elif cmd == "/testpairs":
+        # Debug command to show sample pairs being processed
+        pairs = fetch_pairs()
+        if not pairs:
+            tg_send("No pairs fetched"); return
+        
+        sample_size = min(5, len(pairs))
+        tg_send(f"Sample of {sample_size} pairs from {len(pairs)} total:")
+        
+        for i, p in enumerate(pairs[:sample_size]):
+            symbol = _pair_symbol(p)
+            age = _age_minutes(p)
+            fdv = safe_float(p.get("fdv"), -1)
+            liq = safe_float((p.get("liquidity") or {}).get("usd"), 0.0)
+            
+            is_meme, meme_reason = is_meme_candidate(p)
+            is_new = is_new_pair(p)
+            can_launch, launch_reason = should_launch_snipe(p)
+            
+            tg_send(f"{i+1}. {symbol} | Age: {age:.1f}m | FDV: ${fdv:,.0f} | Liq: ${liq:,.0f}\n"
+                   f"   Meme: {is_meme} ({meme_reason})\n"
+                   f"   New: {is_new} | Launch: {can_launch} ({launch_reason[:50]})")
 
     else:
         tg_send("Unknown command. Type /help")
@@ -1295,17 +1358,45 @@ def trading_loop():
                 time.sleep(int(settings["poll_sec"]))
                 continue
 
+            # Debug: Show what we got
+            total_pairs = len(pairs)
+            meme_candidates = 0
+            new_pairs = 0
+            for p in pairs:
+                is_meme, _ = is_meme_candidate(p)
+                if is_meme:
+                    meme_candidates += 1
+                if is_new_pair(p):
+                    new_pairs += 1
+            
+            if settings.get("debug_buys", False):
+                tg_send(f"DEBUG: Fetched {total_pairs} pairs, {meme_candidates} meme candidates, {new_pairs} new pairs (≤{int(settings.get('max_pair_age_min', 15))}m old)")
+
             # Keep a price map for momentum + PnL management
             price_by_addr = current_price_map(pairs)
 
             # 1) Launch snipe — fastest path (meme gate is inside should_launch_snipe)
             debug_msgs = 0
+            launch_candidates = 0
+            launch_rejected = {}
+            
             for p in pairs:
                 ok, why = should_launch_snipe(p)
-                if ok and not state.get("paused", False) and can_buy():
-                    if not try_buy(p, reason=why) and settings.get("debug_buys") and debug_msgs < int(settings.get("debug_max_msgs_per_cycle", 5)):
-                        tg_send(f"SKIP launch: {_why_not_buy(p, why)}")
-                        debug_msgs += 1
+                if ok:
+                    launch_candidates += 1
+                    if not state.get("paused", False) and can_buy():
+                        if not try_buy(p, reason=why) and settings.get("debug_buys") and debug_msgs < int(settings.get("debug_max_msgs_per_cycle", 5)):
+                            tg_send(f"SKIP launch: {_why_not_buy(p, why)}")
+                            debug_msgs += 1
+                else:
+                    # Track why launches are being rejected
+                    rejection_reason = why.split(":")[0] if ":" in why else why
+                    launch_rejected[rejection_reason] = launch_rejected.get(rejection_reason, 0) + 1
+            
+            if settings.get("debug_buys", False) and launch_candidates == 0 and launch_rejected:
+                top_rejections = sorted(launch_rejected.items(), key=lambda x: x[1], reverse=True)[:3]
+                rejection_summary = ", ".join([f"{reason}({count})" for reason, count in top_rejections])
+                tg_send(f"DEBUG: No launch candidates. Top rejections: {rejection_summary}")
 
             # 2) Quantum smart scorer — must satisfy (liq OR vol) and (2x predictor)
             if settings.get("quantum_enabled", True) and not state.get("paused", False):
