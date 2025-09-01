@@ -1,4 +1,4 @@
-# main.py — Advanced Solana Meme Coin Trading Bot hellooooooo
+# main.py — Advanced Solana Meme Coin Trading Bot
 # Three distinct modes: Sniper, Mid-Cap, and Prediction Bot
 
 import os, re, time, json, threading, requests, signal, sys, math, statistics
@@ -466,7 +466,7 @@ def tg_send_keyboard(text: str, keyboard: List[List[Dict]]) -> None:
     try:
         url = f"https://api.telegram.org/bot{Config.TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
-            "chat_id": Config.TEGRAM_CHAT_ID,
+            "chat_id": Config.TELEGRAM_CHAT_ID,
             "text": text,
             "reply_markup": {"inline_keyboard": keyboard}
         }
@@ -596,7 +596,7 @@ class SolanaMemeBot:
             return self.scanner._apply_prediction_filters(token)
         return False
     
-    def _get_buy_reason(self, token: Dict) -> str:
+    def _get_buy_reason(self, token: Dict) -> bool:
         """Get reason for buying token"""
         if self.state.mode == BotMode.SNIPER:
             return "Fresh mint - quick flip opportunity"
