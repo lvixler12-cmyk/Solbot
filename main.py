@@ -720,9 +720,28 @@ def is_meme_candidate(p: dict) -> Tuple[bool, str]:
 # === Base Filter Logic ==
 # =========================
 def _age_minutes(p: dict) -> float:
-    ts_ms = p.get("pairCreatedAt")
-    if not ts_ms: return 1e9
-    return max(0.0, (now()*1000 - float(ts_ms)) / 60000.0)
+    # Try multiple timestamp fields that Dexscreener might use
+    ts_ms = p.get("pairCreatedAt") or p.get("createdAt") or p.get("firstSeenAt")
+    
+    if not ts_ms:
+        # If no timestamp, assume it's very old to be safe
+        return 1e9
+    
+    try:
+        # Handle both milliseconds and seconds timestamps
+        ts_float = float(ts_ms)
+        current_ms = now() * 1000
+        
+        # If timestamp looks like seconds (< year 2030 in seconds), convert to ms
+        if ts_float < 1900000000000:  # Less than year 2030 in milliseconds
+            ts_float *= 1000
+        
+        age_ms = max(0.0, current_ms - ts_float)
+        age_minutes = age_ms / 60000.0
+        
+        return age_minutes
+    except (ValueError, TypeError):
+        return 1e9
 
 def _base_conditions(p: dict, vol_win: int) -> Tuple[bool, bool, bool]:
     """Return (liq_ok, vol_ok, cap_ok) for a pair under current settings."""
@@ -895,36 +914,48 @@ def dex_allowed(p: dict) -> bool:
     return any(k in dexid or k in url for k in allow)
 
 def is_new_pair(p: dict) -> bool:
-    max_age_min = int(settings.get("max_pair_age_min", 8))
-    ts_ms = p.get("pairCreatedAt")
+    max_age_min = int(settings.get("max_pair_age_min", 30))
+    
+    # Try multiple timestamp fields
+    ts_ms = p.get("pairCreatedAt") or p.get("createdAt") or p.get("firstSeenAt")
+    
     if not ts_ms:
-        return False
-    age_min = max(0, (now()*1000 - float(ts_ms)) / 60000.0)
-    return age_min <= max_age_min
+        # If no timestamp available, be permissive and assume it could be new
+        # This helps catch tokens where timestamp data is missing
+        return True
+    
+    try:
+        age_min = _age_minutes(p)
+        is_new = age_min <= max_age_min
+        
+        # Debug log for troubleshooting
+        if settings.get("debug_buys", False):
+            print(f"[DEBUG] {_pair_symbol(p)}: age={age_min:.1f}m, max={max_age_min}m, new={is_new}")
+        
+        return is_new
+    except Exception as e:
+        print(f"[WARN] Age calculation error for {_pair_symbol(p)}: {e}")
+        return True  # Be permissive on errors
 
 def basic_launch_checks(p: dict) -> Tuple[bool, str]:
     liq = safe_float((p.get("liquidity") or {}).get("usd"), 0.0)
     buys = safe_float(((p.get("txns") or {}).get("m5") or {}).get("buys"), 0.0)
     sells = safe_float(((p.get("txns") or {}).get("m5") or {}).get("sells"), 0.0)
     
-    # More lenient liquidity check for very new tokens (some may start with lower liq)
-    min_liq = float(settings.get("launch_liq_min", 1500))
+    # Very lenient liquidity check 
+    min_liq = float(settings.get("launch_liq_min", 300))
     if liq < min_liq:
-        # For very new pairs (< 5 minutes), be more lenient on liquidity
-        age_min = _age_minutes(p)
-        if age_min <= 5 and liq >= (min_liq * 0.3):  # 30% of min liq for very new pairs
-            pass  # Allow it
-        else:
-            return False, f"launch: liq {liq:.0f} < min {min_liq:.0f}"
+        return False, f"launch: liq {liq:.0f} < min {min_liq:.0f}"
     
-    # Check for early buying activity (sign of interest)
-    min_buys = float(settings.get("launch_min_buys_m5", 3))
+    # Very lenient buying activity check
+    min_buys = float(settings.get("launch_min_buys_m5", 1))
     if buys < min_buys:
         return False, f"launch: buys m5 {buys:.0f} < min {min_buys:.0f}"
     
-    # Check buy/sell ratio is healthy (more buyers than sellers)
-    if sells > 0 and buys / (sells + 1) < 1.2:  # At least 20% more buys than sells
-        return False, f"launch: unhealthy buy/sell ratio {buys:.0f}/{sells:.0f}"
+    # Don't be too strict on buy/sell ratio for very new tokens
+    total_txns = buys + sells
+    if total_txns >= 5 and sells > buys * 2:  # Only reject if way more sells than buys
+        return False, f"launch: too many sells {buys:.0f}/{sells:.0f}"
     
     return True, "launch: basics ok"
 
@@ -937,16 +968,26 @@ def _maybe_rugcheck(p: dict) -> Tuple[bool, str]:
 def should_launch_snipe(p: dict) -> Tuple[bool, str]:
     if not settings.get("launch_enabled", True):
         return False, "launch: disabled"
-    if not dex_allowed(p):
-        return False, "launch: dex not allowed"
-    if not is_new_pair(p):
-        return False, "launch: too old"
-    # meme/solana gate
+    
+    # meme/solana gate FIRST (most important filter)
     m_ok, why_m = is_meme_candidate(p)
     if not m_ok:
         return False, f"launch: {why_m}"
+    
+    if not dex_allowed(p):
+        return False, "launch: dex not allowed"
+    
+    # Check if pair is new enough (but be permissive if no timestamp)
+    if not is_new_pair(p):
+        # Check if we have timestamp data
+        ts_ms = p.get("pairCreatedAt") or p.get("createdAt") or p.get("firstSeenAt")
+        if ts_ms:  # Only reject if we have timestamp and it's actually old
+            return False, "launch: too old"
+        # If no timestamp, continue (could be new)
+    
     ok, why = basic_launch_checks(p)
     if not ok: return False, why
+    
     rc_ok, rc_note = _maybe_rugcheck(p)
     if not rc_ok: return False, rc_note
 
@@ -1323,6 +1364,8 @@ HELP_TEXT = (
 "/setmom <seconds> – set momentum window in seconds (default 60)\n"
 "/diag – show base filter diagnostics\n"
 "/pause – pause NEW buys   |   /resume – resume NEW buys\n"
+"/forceresume – force resume and reset all cooldowns\n"
+"/ultramode – ultra-aggressive mode (buys almost anything!)\n"
 "/panel – show control buttons\n"
 "/closeall – close all open positions at current market\n"
 "/ping – check bot responsiveness\n"
@@ -1753,6 +1796,50 @@ def handle_text(msg: str) -> None:
     elif cmd == "/resume":
         state["paused"] = False; save_json(STATE_FILE, state)
         tg_send("▶️ Resumed (new buys allowed).")
+    
+    elif cmd == "/forceresume":
+        # Force resume and reset cooldowns
+        state["paused"] = False
+        state["last_buy_time"] = 0
+        state["last_global"] = 0
+        save_json(STATE_FILE, state)
+        tg_send("🚀 FORCE RESUMED! All cooldowns reset, ready to buy immediately.")
+    
+    elif cmd == "/ultramode":
+        # Ultra-aggressive mode that bypasses most restrictions
+        settings.update({
+            "min_liq": 50,                     # Ultra low liquidity
+            "min_vol_usd": 10,                 # Ultra low volume
+            "vol_window_min": 5,
+            "cap_range": [100, 50_000_000],    # Very wide cap range
+            "enforce_cap": False,              # No cap enforcement
+            "filter_mode": "OR",
+            "launch_enabled": True,
+            "max_pair_age_min": 120,           # 2 hours max age
+            "launch_liq_min": 50,              # Ultra low launch liq
+            "launch_min_buys_m5": 0,           # No minimum buys required
+            "launch_require_2x": False,
+            "ai_enabled": True,
+            "ai_confidence_threshold": 40,     # Very low AI threshold
+            "quantum_enabled": True,
+            "quantum_threshold": 30,           # Very low quantum threshold
+            "quantum_require_2x": False,
+            "rugcheck_mode": "off",            # Disable rugcheck
+            "buy_cooldown_sec": 30,            # Short cooldowns
+            "global_cooldown_sec": 5,
+        })
+        state["paused"] = False
+        state["last_buy_time"] = 0
+        state["last_global"] = 0
+        save_json(SETTINGS_FILE, settings)
+        save_json(STATE_FILE, state)
+        tg_send("⚡ ULTRA MODE ACTIVATED!\n"
+               "🚨 MAXIMUM AGGRESSION - Will buy almost anything!\n"
+               "• Min liq: $50 | Min vol: $10\n"
+               "• No age limits | No rugcheck\n" 
+               "• AI threshold: 40% | Quantum: 30%\n"
+               "• Ultra-short cooldowns\n"
+               "⚠️ Use with caution - very aggressive!")
 
     elif cmd == "/closeall":
         pairs = fetch_pairs(); price_map = current_price_map(pairs)
@@ -1841,11 +1928,17 @@ def handle_text(msg: str) -> None:
             fdv = safe_float(p.get("fdv"), -1)
             liq = safe_float((p.get("liquidity") or {}).get("usd"), 0.0)
             
+            # Debug timestamp fields
+            created_at = p.get("pairCreatedAt")
+            first_seen = p.get("firstSeenAt") 
+            created_simple = p.get("createdAt")
+            
             is_meme, meme_reason = is_meme_candidate(p)
             is_new = is_new_pair(p)
             can_launch, launch_reason = should_launch_snipe(p)
             
             tg_send(f"{i+1}. {symbol} | Age: {age:.1f}m | FDV: ${fdv:,.0f} | Liq: ${liq:,.0f}\n"
+                   f"   Timestamps: created={created_at}, seen={first_seen}, simple={created_simple}\n"
                    f"   Meme: {is_meme} ({meme_reason})\n"
                    f"   New: {is_new} | Launch: {can_launch} ({launch_reason[:50]})")
     
@@ -2197,6 +2290,12 @@ def _graceful_exit(*_):
     sys.exit(0)
 
 def telegram_loop():
+    # Auto-resume if paused on startup
+    if state.get("paused", False):
+        state["paused"] = False
+        save_json(STATE_FILE, state)
+        tg_send("🔄 Auto-resumed on startup")
+    
     tg_send("✅ Bot online.\n" + _status_text() + "\nType /panel for buttons or /help for commands.")
     while True:
         try:
