@@ -29,8 +29,9 @@
 #   /meme on
 #   /status  |  /diag
 
-import os, re, time, json, threading, requests, signal, sys, math
-from typing import List, Dict, Any, Tuple
+import os, re, time, json, threading, requests, signal, sys, math, statistics
+from typing import List, Dict, Any, Tuple, Optional
+from collections import deque, defaultdict
 
 # =========================
 # === Telegram Config ====
@@ -113,6 +114,14 @@ DEFAULT_SETTINGS = {
     # ---------- Quantum Scorer (pre-pump logic) ----------
     "quantum_enabled": True,
     "quantum_threshold": 60,          # score ≥ threshold ⇒ candidate
+    
+    # ---------- Advanced AI Analysis ----------
+    "ai_enabled": True,               # enable advanced AI analysis
+    "ai_confidence_threshold": 70,    # minimum AI confidence score (0-100)
+    "ai_require_pattern": False,      # require pattern recognition
+    "ai_require_volume_spike": False, # require volume spike detection
+    "ai_whale_bonus": 15,            # bonus points for whale activity
+    "ai_momentum_weight": 0.3,       # weight for momentum in AI score
     # Small-cap preference band (score is best inside/near this range)
     "q_cap_lo": 10_000,               # 10k
     "q_cap_hi": 5_000_000,            # 5m
@@ -210,11 +219,293 @@ state    = load_json(STATE_FILE,    DEFAULT_STATE)
 # in-memory momentum anchors (pair_addr -> {"t": ts, "p": price})
 _px_anchors: Dict[str, Dict[str, float]] = {}
 
+# Advanced AI Analysis Storage
+_price_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=100))  # Store price history
+_volume_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=50))   # Store volume history
+_whale_activity: Dict[str, List[Dict]] = defaultdict(list)                  # Track large transactions
+_pattern_cache: Dict[str, Dict] = {}                                        # Cache pattern analysis
+
 # =========================
 # === Helpers ============
 # =========================
 def now() -> float: return time.time()
 def clamp(v, lo, hi): return max(lo, min(hi, v))
+
+# =========================
+# === Advanced AI Analysis
+# =========================
+
+class AdvancedAnalyzer:
+    """Advanced AI-powered trading analysis with multiple sophisticated indicators"""
+    
+    @staticmethod
+    def update_price_history(pair_addr: str, price: float, volume: float, timestamp: float = None):
+        """Update price and volume history for analysis"""
+        if timestamp is None:
+            timestamp = now()
+        
+        _price_history[pair_addr].append({
+            'price': price,
+            'timestamp': timestamp,
+            'volume': volume
+        })
+        _volume_history[pair_addr].append(volume)
+    
+    @staticmethod
+    def calculate_rsi(pair_addr: str, period: int = 14) -> Optional[float]:
+        """Calculate Relative Strength Index"""
+        history = _price_history[pair_addr]
+        if len(history) < period + 1:
+            return None
+        
+        prices = [h['price'] for h in list(history)[-period-1:]]
+        deltas = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+        
+        gains = [d for d in deltas if d > 0]
+        losses = [-d for d in deltas if d < 0]
+        
+        if not gains or not losses:
+            return 50.0
+        
+        avg_gain = sum(gains) / len(gains) if gains else 0
+        avg_loss = sum(losses) / len(losses) if losses else 0
+        
+        if avg_loss == 0:
+            return 100.0
+        
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
+    
+    @staticmethod
+    def detect_volume_spike(pair_addr: str, spike_threshold: float = 2.5) -> Tuple[bool, float]:
+        """Detect unusual volume spikes"""
+        volumes = list(_volume_history[pair_addr])
+        if len(volumes) < 10:
+            return False, 0.0
+        
+        recent_vol = volumes[-1]
+        avg_vol = statistics.mean(volumes[-10:-1]) if len(volumes) > 1 else recent_vol
+        
+        if avg_vol == 0:
+            return False, 0.0
+        
+        spike_ratio = recent_vol / avg_vol
+        return spike_ratio >= spike_threshold, spike_ratio
+    
+    @staticmethod
+    def calculate_vwap(pair_addr: str, periods: int = 20) -> Optional[float]:
+        """Calculate Volume Weighted Average Price"""
+        history = list(_price_history[pair_addr])
+        if len(history) < periods:
+            return None
+        
+        recent_data = history[-periods:]
+        total_volume = sum(h['volume'] for h in recent_data)
+        
+        if total_volume == 0:
+            return None
+        
+        vwap = sum(h['price'] * h['volume'] for h in recent_data) / total_volume
+        return vwap
+    
+    @staticmethod
+    def detect_breakout_pattern(pair_addr: str) -> Tuple[bool, str, float]:
+        """Detect chart breakout patterns"""
+        history = list(_price_history[pair_addr])
+        if len(history) < 20:
+            return False, "insufficient_data", 0.0
+        
+        prices = [h['price'] for h in history[-20:]]
+        volumes = [h['volume'] for h in history[-20:]]
+        
+        # Detect ascending triangle pattern
+        highs = []
+        lows = []
+        for i in range(2, len(prices)-2):
+            if prices[i] > prices[i-1] and prices[i] > prices[i+1]:
+                highs.append(prices[i])
+            elif prices[i] < prices[i-1] and prices[i] < prices[i+1]:
+                lows.append(prices[i])
+        
+        if len(highs) >= 3 and len(lows) >= 2:
+            # Check if highs are relatively flat (resistance level)
+            high_variance = statistics.variance(highs[-3:]) if len(highs) >= 3 else float('inf')
+            high_avg = statistics.mean(highs[-3:])
+            
+            # Check if lows are ascending (higher lows)
+            if len(lows) >= 2 and lows[-1] > lows[-2]:
+                current_price = prices[-1]
+                if current_price > high_avg * 0.98 and high_variance < (high_avg * 0.02) ** 2:
+                    confidence = min(0.9, (current_price / high_avg) * 0.8)
+                    return True, "ascending_triangle_breakout", confidence
+        
+        # Detect volume breakout
+        has_volume_spike, spike_ratio = AdvancedAnalyzer.detect_volume_spike(pair_addr, 2.0)
+        if has_volume_spike:
+            price_change = (prices[-1] / prices[-5] - 1) if len(prices) >= 5 else 0
+            if price_change > 0.05:  # 5% price increase with volume spike
+                confidence = min(0.8, spike_ratio / 5.0)
+                return True, "volume_breakout", confidence
+        
+        return False, "no_pattern", 0.0
+    
+    @staticmethod
+    def calculate_momentum_score(pair_addr: str) -> float:
+        """Calculate comprehensive momentum score (0-100)"""
+        history = list(_price_history[pair_addr])
+        if len(history) < 10:
+            return 50.0
+        
+        scores = []
+        
+        # Price momentum (30% weight)
+        prices = [h['price'] for h in history[-10:]]
+        if len(prices) >= 5:
+            short_ma = statistics.mean(prices[-3:])
+            long_ma = statistics.mean(prices[-10:])
+            price_momentum = min(100, max(0, ((short_ma / long_ma - 1) * 500) + 50))
+            scores.append((price_momentum, 0.3))
+        
+        # RSI (20% weight)
+        rsi = AdvancedAnalyzer.calculate_rsi(pair_addr)
+        if rsi is not None:
+            # Convert RSI to momentum score (RSI > 50 = bullish momentum)
+            rsi_momentum = min(100, max(0, rsi))
+            scores.append((rsi_momentum, 0.2))
+        
+        # Volume trend (25% weight)
+        volumes = list(_volume_history[pair_addr])
+        if len(volumes) >= 5:
+            recent_vol_avg = statistics.mean(volumes[-3:])
+            older_vol_avg = statistics.mean(volumes[-10:-3]) if len(volumes) >= 10 else recent_vol_avg
+            if older_vol_avg > 0:
+                vol_momentum = min(100, max(0, ((recent_vol_avg / older_vol_avg - 1) * 200) + 50))
+                scores.append((vol_momentum, 0.25))
+        
+        # Pattern strength (25% weight)
+        has_pattern, pattern_type, confidence = AdvancedAnalyzer.detect_breakout_pattern(pair_addr)
+        if has_pattern:
+            pattern_momentum = 70 + (confidence * 30)  # 70-100 based on confidence
+        else:
+            pattern_momentum = 40  # Neutral
+        scores.append((pattern_momentum, 0.25))
+        
+        # Calculate weighted average
+        if scores:
+            total_weight = sum(weight for _, weight in scores)
+            weighted_sum = sum(score * weight for score, weight in scores)
+            return weighted_sum / total_weight
+        
+        return 50.0
+    
+    @staticmethod
+    def detect_whale_activity(pair_addr: str, txn_data: Dict) -> bool:
+        """Detect large whale transactions"""
+        if not txn_data:
+            return False
+        
+        # Get transaction counts
+        buys = safe_float(txn_data.get("buys", 0))
+        sells = safe_float(txn_data.get("sells", 0))
+        
+        # Look for signs of whale activity:
+        # 1. Low transaction count but high volume (large individual transactions)
+        # 2. Sudden increase in buy pressure
+        
+        total_txns = buys + sells
+        if total_txns < 5 and total_txns > 0:  # Few but potentially large transactions
+            # Check if volume is disproportionately high for transaction count
+            recent_volume = list(_volume_history[pair_addr])[-1] if _volume_history[pair_addr] else 0
+            if recent_volume > 0 and total_txns > 0:
+                avg_txn_size = recent_volume / total_txns
+                # If average transaction size is very large, might be whale activity
+                if avg_txn_size > 10000:  # $10k+ average transaction
+                    return True
+        
+        # Strong buy pressure with reasonable volume
+        if buys > 0 and sells >= 0:
+            buy_ratio = buys / (buys + sells + 1)
+            if buy_ratio > 0.8 and total_txns >= 3:  # 80%+ buys with decent activity
+                return True
+        
+        return False
+    
+    @staticmethod
+    def calculate_ai_confidence(pair_addr: str, pair_data: Dict) -> Tuple[float, Dict[str, float]]:
+        """Calculate AI confidence score with breakdown"""
+        
+        # Update data first
+        price = _read_price(pair_data)
+        volume = safe_float((pair_data.get("volume") or {}).get("m5", 0))
+        AdvancedAnalyzer.update_price_history(pair_addr, price, volume)
+        
+        scores = {}
+        
+        # Momentum analysis (25%)
+        momentum_score = AdvancedAnalyzer.calculate_momentum_score(pair_addr)
+        scores['momentum'] = momentum_score
+        
+        # Volume analysis (20%)
+        has_spike, spike_ratio = AdvancedAnalyzer.detect_volume_spike(pair_addr)
+        volume_score = min(100, 50 + (spike_ratio * 10)) if has_spike else 40
+        scores['volume'] = volume_score
+        
+        # Pattern recognition (20%)
+        has_pattern, pattern_type, pattern_conf = AdvancedAnalyzer.detect_breakout_pattern(pair_addr)
+        pattern_score = (70 + pattern_conf * 30) if has_pattern else 35
+        scores['pattern'] = pattern_score
+        
+        # Whale activity (15%)
+        txn_data = (pair_data.get("txns") or {}).get("m5") or {}
+        has_whales = AdvancedAnalyzer.detect_whale_activity(pair_addr, txn_data)
+        whale_score = 75 if has_whales else 45
+        scores['whale'] = whale_score
+        
+        # Market structure (10%)
+        rsi = AdvancedAnalyzer.calculate_rsi(pair_addr)
+        if rsi is not None:
+            # Optimal RSI for entry: 45-65 (not oversold, not overbought)
+            if 45 <= rsi <= 65:
+                structure_score = 80
+            elif 30 <= rsi <= 75:
+                structure_score = 60
+            else:
+                structure_score = 30
+        else:
+            structure_score = 50
+        scores['structure'] = structure_score
+        
+        # Price action (10%)
+        history = list(_price_history[pair_addr])
+        if len(history) >= 5:
+            recent_prices = [h['price'] for h in history[-5:]]
+            price_trend = (recent_prices[-1] / recent_prices[0] - 1) * 100
+            if price_trend > 5:  # Strong uptrend
+                action_score = 80
+            elif price_trend > 0:  # Mild uptrend
+                action_score = 65
+            elif price_trend > -5:  # Sideways
+                action_score = 50
+            else:  # Downtrend
+                action_score = 25
+        else:
+            action_score = 50
+        scores['price_action'] = action_score
+        
+        # Calculate weighted final score
+        weights = {
+            'momentum': 0.25,
+            'volume': 0.20,
+            'pattern': 0.20,
+            'whale': 0.15,
+            'structure': 0.10,
+            'price_action': 0.10
+        }
+        
+        final_score = sum(scores[key] * weights[key] for key in scores.keys())
+        
+        return final_score, scores
 
 def safe_float(x, default=0.0) -> float:
     try:
@@ -889,12 +1180,49 @@ def manage_positions(prices_by_addr: Dict[str, float]) -> None:
         held_ok = (now() - float(pos.get("opened_ts", now()))) >= min_hold
 
         reason = None
-        if pct >= tp and held_ok: reason = "take-profit"
-        elif pct <= -sl and held_ok: reason = "stop-loss"
-        elif dd_from_high <= -trail and held_ok: reason = "trailing stop"
+        
+        # Traditional exit conditions
+        if pct >= tp and held_ok: 
+            reason = "take-profit"
+        elif pct <= -sl and held_ok: 
+            reason = "stop-loss"
+        elif dd_from_high <= -trail and held_ok: 
+            reason = "trailing stop"
+        
+        # AI-powered exit signals (if enabled and we have enough data)
+        if not reason and settings.get("ai_enabled", True) and held_ok:
+            try:
+                # Get current pair data for this address
+                pairs = fetch_pairs()
+                current_pair = None
+                for p in pairs:
+                    if p.get("pairAddress") == addr:
+                        current_pair = p
+                        break
+                
+                if current_pair:
+                    ai_score, ai_breakdown = AdvancedAnalyzer.calculate_ai_confidence(addr, current_pair)
+                    
+                    # AI Exit conditions:
+                    # 1. Very low AI confidence (< 30) suggests exit
+                    # 2. RSI overbought (> 80) with declining momentum
+                    # 3. Volume drying up with pattern breakdown
+                    
+                    if ai_score < 30:
+                        reason = f"AI-exit (confidence {ai_score:.0f}%)"
+                    elif ai_breakdown.get('structure', 50) > 80 and ai_breakdown.get('momentum', 50) < 40:
+                        reason = "AI-exit (overbought + weak momentum)"
+                    elif ai_breakdown.get('volume', 50) < 25 and pct > 0.1:  # Volume dying, take some profit
+                        reason = "AI-exit (volume decline)"
+                        
+            except Exception as e:
+                # Don't let AI analysis errors affect normal operation
+                pass
 
-        if reason: to_close.append((addr, pos, reason, cur, pct))
-        else: state["open_positions"][addr] = pos
+        if reason: 
+            to_close.append((addr, pos, reason, cur, pct))
+        else: 
+            state["open_positions"][addr] = pos
 
     for addr, pos, reason, cur, pct in to_close:
         try_sell(addr, pos, reason, cur, pct)
@@ -929,6 +1257,11 @@ HELP_TEXT = (
 "/qstatus – show scorer config & weights\n"
 "/qparams – dump current quantum params (JSON)\n"
 "/qset <key> <value> – set a quantum param\n"
+"/ai on|off [threshold] – enable advanced AI analysis & set confidence threshold\n"
+"/aistatus – show AI analysis configuration\n"
+"/aitest <symbol> – test AI analysis on specific pair\n"
+"/aiconfig pattern|volume on/off – require pattern/volume for AI path\n"
+"/aiconfig threshold <0-100> – set AI confidence threshold\n"
 "/2x on|off [minutes] [alpha] – toggle 2× predictor, optional minutes & alpha\n"
 "/setmom <seconds> – set momentum window in seconds (default 60)\n"
 "/diag – show base filter diagnostics\n"
@@ -981,6 +1314,7 @@ def _status_text() -> str:
         f"LaunchSnipe: {('ON' if settings.get('launch_enabled') else 'OFF')} "
         f"(dex={','.join(settings.get('allowed_dex_ids',[]))}, age≤{int(settings.get('max_pair_age_min',8))}m, 2x_required={bool(settings.get('launch_require_2x',True))})\n"
         f"Quantum: {('ON' if settings.get('quantum_enabled') else 'OFF')} (thr={int(settings.get('quantum_threshold',60))}, gate=(liq OR vol), 2x_required={bool(settings.get('quantum_require_2x',True))})\n"
+        f"🤖 AI Analysis: {('ON' if settings.get('ai_enabled') else 'OFF')} (thr={int(settings.get('ai_confidence_threshold',70))}%, pattern_req={bool(settings.get('ai_require_pattern'))}, vol_req={bool(settings.get('ai_require_volume_spike'))})\n"
         f"2× Predictor: {two_x} (M={float(settings.get('two_x_minutes',2))}m, alpha={float(settings.get('two_x_alpha',0.8))}, window={int(settings.get('momentum_window_sec',60))}s)\n"
         f"RugCheck: {settings.get('rugcheck_mode','off').upper()} (min {int(settings['rugcheck_score_min'])})\n"
         f"Twitter: {('ON' if twitter_enabled() else 'OFF')} (tracked: {len(settings.get('twitter_accounts',[]))})\n"
@@ -1259,6 +1593,82 @@ def handle_text(msg: str) -> None:
         except Exception:
             tg_send("❌ Example: /setmom 60")
 
+    elif cmd == "/ai" and len(parts) >= 2:
+        v = parts[1].lower()
+        if v in ("on","true","1"):
+            settings["ai_enabled"] = True
+            if len(parts) >= 3:
+                try: settings["ai_confidence_threshold"] = int(parts[2])
+                except: pass
+        elif v in ("off","false","0"):
+            settings["ai_enabled"] = False
+        else:
+            tg_send("❌ Usage: /ai on|off [threshold]"); return
+        save_json(SETTINGS_FILE, settings)
+        tg_send(f"✅ AI analysis set to {settings['ai_enabled']} (threshold={int(settings['ai_confidence_threshold'])})")
+
+    elif cmd == "/aistatus":
+        ai_on = settings.get("ai_enabled", True)
+        threshold = int(settings.get("ai_confidence_threshold", 70))
+        req_pattern = bool(settings.get("ai_require_pattern", False))
+        req_vol = bool(settings.get("ai_require_volume_spike", False))
+        tg_send(f"🤖 AI Analysis: {'ON' if ai_on else 'OFF'}\n"
+               f"Confidence threshold: {threshold}%\n"
+               f"Require pattern: {req_pattern}\n"
+               f"Require volume spike: {req_vol}")
+
+    elif cmd == "/aitest" and len(parts) >= 2:
+        # Test AI analysis on a specific pair
+        pairs = fetch_pairs()
+        if not pairs:
+            tg_send("No pairs available"); return
+        
+        search_term = parts[1].upper()
+        found_pair = None
+        for p in pairs:
+            symbol = _pair_symbol(p)
+            if search_term in symbol.upper():
+                found_pair = p
+                break
+        
+        if not found_pair:
+            tg_send(f"Pair containing '{search_term}' not found"); return
+        
+        pair_addr = found_pair.get("pairAddress") or ""
+        if not pair_addr:
+            tg_send("No pair address found"); return
+        
+        ai_score, breakdown = AdvancedAnalyzer.calculate_ai_confidence(pair_addr, found_pair)
+        symbol = _pair_symbol(found_pair)
+        
+        tg_send(f"🤖 AI Analysis for {symbol}:\n"
+               f"Overall Score: {ai_score:.1f}%\n"
+               f"Momentum: {breakdown['momentum']:.1f}%\n"
+               f"Volume: {breakdown['volume']:.1f}%\n"
+               f"Pattern: {breakdown['pattern']:.1f}%\n"
+               f"Whale Activity: {breakdown['whale']:.1f}%\n"
+               f"Market Structure: {breakdown['structure']:.1f}%\n"
+               f"Price Action: {breakdown['price_action']:.1f}%")
+
+    elif cmd == "/aiconfig" and len(parts) >= 3:
+        key = parts[1]
+        val = parts[2].lower()
+        
+        if key == "pattern":
+            settings["ai_require_pattern"] = val in ("on","true","1")
+            save_json(SETTINGS_FILE, settings)
+            tg_send(f"✅ AI pattern requirement: {settings['ai_require_pattern']}")
+        elif key == "volume":
+            settings["ai_require_volume_spike"] = val in ("on","true","1")
+            save_json(SETTINGS_FILE, settings)
+            tg_send(f"✅ AI volume spike requirement: {settings['ai_require_volume_spike']}")
+        elif key == "threshold" and val.isdigit():
+            settings["ai_confidence_threshold"] = max(0, min(100, int(val)))
+            save_json(SETTINGS_FILE, settings)
+            tg_send(f"✅ AI confidence threshold: {settings['ai_confidence_threshold']}%")
+        else:
+            tg_send("❌ Usage: /aiconfig pattern|volume on/off OR /aiconfig threshold <0-100>")
+
     elif cmd == "/panel":
         tg_send("Control panel:", reply_markup=panel_markup(bool(state.get("paused"))))
 
@@ -1453,6 +1863,65 @@ def trading_loop():
                         q_debug += 1
                     if not can_buy():
                         break
+
+            # 2.5) AI-Powered Analysis Path - Advanced pattern recognition and analysis
+            if settings.get("ai_enabled", True) and not state.get("paused", False):
+                ai_threshold = float(settings.get("ai_confidence_threshold", 70))
+                ai_debug = 0
+                ai_candidates = []
+                
+                # Analyze all meme candidates with AI
+                for p in pairs:
+                    mem_ok, _ = is_meme_candidate(p)
+                    if not mem_ok:
+                        continue
+                    
+                    pair_addr = p.get("pairAddress") or ""
+                    if not pair_addr:
+                        continue
+                    
+                    # Calculate AI confidence
+                    ai_score, ai_breakdown = AdvancedAnalyzer.calculate_ai_confidence(pair_addr, p)
+                    
+                    if ai_score >= ai_threshold:
+                        ai_candidates.append((ai_score, p, ai_breakdown))
+                
+                # Sort by AI confidence and try to buy
+                ai_candidates.sort(key=lambda x: x[0], reverse=True)
+                
+                for ai_score, p, breakdown in ai_candidates:
+                    if not can_buy():
+                        break
+                    
+                    # Optional additional requirements
+                    skip_reason = None
+                    
+                    if settings.get("ai_require_pattern", False):
+                        pair_addr = p.get("pairAddress") or ""
+                        has_pattern, _, _ = AdvancedAnalyzer.detect_breakout_pattern(pair_addr)
+                        if not has_pattern:
+                            skip_reason = "no pattern detected"
+                    
+                    if settings.get("ai_require_volume_spike", False):
+                        pair_addr = p.get("pairAddress") or ""
+                        has_spike, _ = AdvancedAnalyzer.detect_volume_spike(pair_addr)
+                        if not has_spike:
+                            skip_reason = "no volume spike"
+                    
+                    if skip_reason:
+                        if settings.get("debug_buys") and ai_debug < int(settings.get("debug_max_msgs_per_cycle", 5)):
+                            tg_send(f"SKIP AI ({_pair_symbol(p)}): {skip_reason}")
+                            ai_debug += 1
+                        continue
+                    
+                    # Create detailed reason with breakdown
+                    reason = (f"AI {ai_score:.1f}% "
+                             f"mom:{breakdown['momentum']:.0f} vol:{breakdown['volume']:.0f} "
+                             f"pat:{breakdown['pattern']:.0f} whale:{breakdown['whale']:.0f}")
+                    
+                    if not try_buy(p, reason=reason) and settings.get("debug_buys") and ai_debug < int(settings.get("debug_max_msgs_per_cycle", 5)):
+                        tg_send(f"SKIP AI: {_why_not_buy(p)}")
+                        ai_debug += 1
 
             # 3) Base Filter (configurable) + meme gate already inside
             filtered = filter_pairs_logic(pairs)
