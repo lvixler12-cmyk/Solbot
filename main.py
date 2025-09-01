@@ -67,20 +67,20 @@ STATE_FILE    = "state.json"
 
 DEFAULT_SETTINGS = {
     # ---------- Base Filter conditions (evaluated with a logic mode) ----------
-    "min_liq": 2000,                   # USD liquidity (lower for meme tokens)
-    "min_vol_usd": 200,                # USD volume threshold on window (lower for new tokens)
-    "vol_window_min": 5,               # volume window in minutes (shorter for faster detection)
-    "cap_range": [5000, 2_000_000],    # FDV band (USD) - better meme range
-    "enforce_cap": True,               # include cap condition in base filter
+    "min_liq": 500,                    # USD liquidity (very low for new meme tokens)
+    "min_vol_usd": 50,                 # USD volume threshold (very low for new tokens)
+    "vol_window_min": 5,               # volume window in minutes (short for new detection)
+    "cap_range": [1000, 5_000_000],    # FDV band (USD) - wider meme range
+    "enforce_cap": False,              # disable cap condition initially to catch more
     "pass_if_cap_unknown": True,       # unknown FDV counts as cap_ok
 
     # ---------- Filter Logic Mode ----------
     # Modes: "OR", "AND", "MAJORITY", "HYBRID"
-    "filter_mode": "HYBRID",           # Use HYBRID for better new token detection
+    "filter_mode": "OR",               # Use OR mode to be most permissive
     # For MAJORITY/HYBRID fallback: how many of {liq, vol, cap} must be true
-    "min_true": 1,                     # More lenient for new tokens
+    "min_true": 1,                     # Very lenient for new tokens
     # HYBRID: if pair age ≤ hybrid_new_age_min, require liq AND vol; else MAJORITY(min_true)
-    "hybrid_new_age_min": 5,           # Very new tokens get stricter checks
+    "hybrid_new_age_min": 10,          # Longer window for new token detection
 
     # ---------- Solana MEME focus ----------
     "solana_only": True,                                # only consider chainId == 'solana'
@@ -91,9 +91,9 @@ DEFAULT_SETTINGS = {
     # ---------- Launch Snipe ----------
     "launch_enabled": True,
     "allowed_dex_ids": ["raydium", "pump", "meteora", "bunk", "jupiter"],  # added jupiter
-    "max_pair_age_min": 15,             # pair must be ≤ N minutes old (increased to catch more)
-    "launch_liq_min": 800,              # min liq for launch snipe path (lower for new memes)
-    "launch_min_buys_m5": 2,            # buys in last 5m for early traction (lower threshold)
+    "max_pair_age_min": 30,             # pair must be ≤ N minutes old (increased to catch more)
+    "launch_liq_min": 300,              # min liq for launch snipe path (very low for new memes)
+    "launch_min_buys_m5": 1,            # buys in last 5m for early traction (very low threshold)
     "launch_require_2x": False,         # disable 2x requirement for launch to catch more early
 
     # ---------- RugCheck Gate ----------
@@ -580,13 +580,22 @@ def current_price_map(pairs: List[Dict[str, Any]]) -> Dict[str, float]:
     return out
 
 def _vol_window_value(p: dict, minutes: int) -> float:
-    """Volume proxy for N minutes: max(m5, h1 * N/60)."""
+    """Volume proxy for N minutes: max(m5, h1 * N/60, m1*minutes)."""
     vol = p.get("volume") or {}
     m5 = safe_float(vol.get("m5"), 0.0)
     h1 = safe_float(vol.get("h1"), 0.0)
-    est = h1 * (minutes / 60.0)
-    if minutes == 5: return m5
-    return max(m5, est)
+    m1 = safe_float(vol.get("m1"), 0.0)  # 1-minute volume for very new tokens
+    
+    # For very new tokens, use 1-minute volume extrapolated
+    est_from_h1 = h1 * (minutes / 60.0)
+    est_from_m1 = m1 * minutes
+    
+    if minutes <= 5:
+        # For short windows, prefer m5 or m1 extrapolation
+        return max(m5, est_from_m1)
+    else:
+        # For longer windows, use best available estimate
+        return max(m5, est_from_h1, est_from_m1)
 
 # =========================
 # === RugCheck (optional)
@@ -667,8 +676,8 @@ def is_meme_candidate(p: dict) -> Tuple[bool, str]:
         fdv = safe_float(p.get("marketCap"), -1)
     
     if fdv > 0:
-        # Meme tokens typically have market caps between 10k and 50M
-        if fdv < 1000 or fdv > 50_000_000:
+        # Very permissive market cap range for meme tokens (allow micro caps)
+        if fdv < 100 or fdv > 100_000_000:  # $100 to $100M range
             return False, f"market cap {fdv:,.0f} outside meme range"
     
     return True, "meme candidate ok"
@@ -691,13 +700,27 @@ def _base_conditions(p: dict, vol_win: int) -> Tuple[bool, bool, bool]:
     enforce_cap = bool(settings.get("enforce_cap", True))
     pass_if_unknown = bool(settings.get("pass_if_cap_unknown", True))
 
+    # Check if this is a very new token (≤ 10 minutes old)
+    age_min = _age_minutes(p)
+    is_very_new = age_min <= 10
+    
     liq = safe_float((p.get("liquidity") or {}).get("usd"), 0.0)
-    liq_ok = (liq >= min_liq)
+    
+    # More lenient liquidity requirements for very new tokens
+    if is_very_new and liq >= (min_liq * 0.3):  # 30% of normal requirement
+        liq_ok = True
+    else:
+        liq_ok = (liq >= min_liq)
 
     v = _vol_window_value(p, vol_win)
-    vol_ok = (v >= min_vol)
+    
+    # More lenient volume requirements for very new tokens
+    if is_very_new and v >= (min_vol * 0.2):  # 20% of normal requirement
+        vol_ok = True
+    else:
+        vol_ok = (v >= min_vol)
 
-    cap_ok = False
+    cap_ok = True  # Default to true for new tokens
     if enforce_cap:
         fdv = safe_float(p.get("fdv"), -1)
         if fdv <= 0:
@@ -1270,6 +1293,8 @@ HELP_TEXT = (
 "/closeall – close all open positions at current market\n"
 "/ping – check bot responsiveness\n"
 "/testpairs – debug: show sample pairs being processed\n"
+"/debugfilters – detailed filter analysis and troubleshooting\n"
+"/mememode – quick setup for optimal meme token sniping\n"
 )
 
 def panel_markup(paused: bool) -> dict:
@@ -1705,6 +1730,46 @@ def handle_text(msg: str) -> None:
     elif cmd == "/ping":
         tg_send("pong 🟩")
     
+    elif cmd == "/mememode":
+        # Quick setup for optimal meme token sniping
+        settings.update({
+            "min_liq": 300,
+            "min_vol_usd": 25,
+            "vol_window_min": 5,
+            "cap_range": [1000, 10_000_000],
+            "enforce_cap": False,
+            "filter_mode": "OR",
+            "min_true": 1,
+            "launch_enabled": True,
+            "max_pair_age_min": 30,
+            "launch_liq_min": 200,
+            "launch_min_buys_m5": 1,
+            "launch_require_2x": False,
+            "ai_enabled": True,
+            "ai_confidence_threshold": 65,
+            "quantum_enabled": True,
+            "quantum_threshold": 55,
+            "rugcheck_mode": "lenient"
+        })
+        save_json(SETTINGS_FILE, settings)
+        tg_send("🎯 MEME MODE ACTIVATED!\n"
+               "✅ Ultra-aggressive settings for new meme token detection:\n"
+               "• Min liq: $300 | Min vol: $25 (5m)\n"
+               "• Cap range: $1K-$10M | No cap enforcement\n"
+               "• Launch age: ≤30min | Min buys: 1\n"
+               "• AI threshold: 65% | Quantum: 55%\n"
+               "• Filter: OR mode (most permissive)\n"
+               "Ready to catch new meme tokens! 🚀")
+        # Immediately run diagnostics with new settings
+        pairs = fetch_pairs()
+        if pairs:
+            _ = filter_pairs_logic(pairs, for_diag=True)
+            d = state.get("_diag", {})
+            tg_send(f"📊 New results: {d.get('total',0)} total, "
+                   f"liq_pass: {d.get('pass_liq',0)}, "
+                   f"vol_pass: {d.get('pass_vol',0)}, "
+                   f"cap_pass: {d.get('pass_cap',0)}")
+    
     elif cmd == "/testpairs":
         # Debug command to show sample pairs being processed
         pairs = fetch_pairs()
@@ -1727,6 +1792,42 @@ def handle_text(msg: str) -> None:
             tg_send(f"{i+1}. {symbol} | Age: {age:.1f}m | FDV: ${fdv:,.0f} | Liq: ${liq:,.0f}\n"
                    f"   Meme: {is_meme} ({meme_reason})\n"
                    f"   New: {is_new} | Launch: {can_launch} ({launch_reason[:50]})")
+    
+    elif cmd == "/debugfilters":
+        # Show detailed filter analysis for troubleshooting
+        pairs = fetch_pairs()
+        if not pairs:
+            tg_send("No pairs fetched"); return
+        
+        vol_win = max(5, min(60, int(safe_float(settings.get("vol_window_min", 10), 10))))
+        meme_count = 0
+        filter_stats = {"liq_fail": 0, "vol_fail": 0, "cap_fail": 0, "age_stats": []}
+        
+        for p in pairs:
+            is_meme, _ = is_meme_candidate(p)
+            if not is_meme:
+                continue
+            meme_count += 1
+            
+            age = _age_minutes(p)
+            filter_stats["age_stats"].append(age)
+            
+            liq_ok, vol_ok, cap_ok = _base_conditions(p, vol_win)
+            if not liq_ok: filter_stats["liq_fail"] += 1
+            if not vol_ok: filter_stats["vol_fail"] += 1  
+            if not cap_ok: filter_stats["cap_fail"] += 1
+        
+        if meme_count > 0:
+            avg_age = sum(filter_stats["age_stats"]) / len(filter_stats["age_stats"])
+            min_age = min(filter_stats["age_stats"])
+            tg_send(f"🔍 Filter Debug ({meme_count} meme candidates):\n"
+                   f"Avg age: {avg_age:.1f}m (newest: {min_age:.1f}m)\n"
+                   f"Liq failures: {filter_stats['liq_fail']}\n"
+                   f"Vol failures: {filter_stats['vol_fail']}\n"
+                   f"Cap failures: {filter_stats['cap_fail']}\n"
+                   f"Current thresholds: liq≥${int(settings['min_liq'])}, vol≥${int(settings['min_vol_usd'])} ({vol_win}m)")
+        else:
+            tg_send("No meme candidates found in current pairs")
 
     else:
         tg_send("Unknown command. Type /help")
