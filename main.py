@@ -520,36 +520,70 @@ def safe_float(x, default=0.0) -> float:
 # === Dexscreener Fetch ==
 # =========================
 DEX_URLS = [
-    "https://api.dexscreener.com/latest/dex/pairs/solana",  # Get all Solana pairs
-    "https://api.dexscreener.com/latest/dex/search?q=chain:solana",
-    "https://api.dexscreener.com/latest/dex/search?q=solana",
-    "https://api.dexscreener.com/latest/dex/search?q=SOL"
+    "https://api.dexscreener.com/latest/dex/search?q=SOL",     # Search for SOL pairs
+    "https://api.dexscreener.com/latest/dex/search?q=USDC",    # Search for USDC pairs  
+    "https://api.dexscreener.com/latest/dex/search?q=pump",    # Search for pump.fun pairs
+    "https://api.dexscreener.com/latest/dex/search?q=raydium", # Search for Raydium pairs
 ]
 
 def fetch_pairs() -> List[Dict[str, Any]]:
     """Fetch pairs via search; try multiple endpoints; exponential backoff on transient errors."""
+    all_pairs = []
+    
     for url in DEX_URLS:
         try:
+            print(f"[INFO] Trying: {url}")
             r = requests.get(url, timeout=15)
+            print(f"[INFO] Response: {r.status_code}")
+            
             if r.status_code == 200:
                 data = r.json() or {}
                 pairs = data.get("pairs") or []
+                
                 if isinstance(pairs, list) and pairs:
-                    state["backoff"] = 0
-                    save_json(STATE_FILE, state)
-                    return pairs
+                    print(f"[INFO] Got {len(pairs)} pairs from {url}")
+                    # Filter for Solana pairs only
+                    solana_pairs = [p for p in pairs if str(p.get("chainId", "")).lower() == "solana"]
+                    print(f"[INFO] {len(solana_pairs)} Solana pairs")
+                    all_pairs.extend(solana_pairs)
+                else:
+                    print(f"[WARN] No pairs in response from {url}")
+                    
+            elif r.status_code == 404:
+                print(f"[WARN] Endpoint not found: {url}")
+                continue
             elif r.status_code in (429, 500, 502, 503, 504):
+                print(f"[WARN] Server error {r.status_code}, will backoff")
                 break
             else:
                 print(f"[WARN] Dexscreener HTTP {r.status_code} on {url}")
                 continue
+                
         except Exception as e:
             print(f"[WARN] Dexscreener error on {url}: {e}")
             continue
+    
+    if all_pairs:
+        # Remove duplicates by pairAddress
+        seen = set()
+        unique_pairs = []
+        for p in all_pairs:
+            addr = p.get("pairAddress")
+            if addr and addr not in seen:
+                seen.add(addr)
+                unique_pairs.append(p)
+        
+        print(f"[INFO] Total unique Solana pairs: {len(unique_pairs)}")
+        state["backoff"] = 0
+        save_json(STATE_FILE, state)
+        return unique_pairs
+    
+    # Apply backoff if no data retrieved
     back = state.get("backoff", 0)
     back = settings["min_backoff"] if back == 0 else min(int(back * 2), int(settings["max_backoff"]))
     state["backoff"] = back
     save_json(STATE_FILE, state)
+    print(f"[WARN] No pairs fetched, applying {back}s backoff")
     return []
 
 def _pair_id(p: dict) -> str:
@@ -1292,6 +1326,7 @@ HELP_TEXT = (
 "/panel – show control buttons\n"
 "/closeall – close all open positions at current market\n"
 "/ping – check bot responsiveness\n"
+"/testapi – test Dexscreener API endpoints\n"
 "/testpairs – debug: show sample pairs being processed\n"
 "/debugfilters – detailed filter analysis and troubleshooting\n"
 "/mememode – quick setup for optimal meme token sniping\n"
@@ -1729,6 +1764,27 @@ def handle_text(msg: str) -> None:
 
     elif cmd == "/ping":
         tg_send("pong 🟩")
+    
+    elif cmd == "/testapi":
+        # Test Dexscreener API endpoints
+        tg_send("🔍 Testing Dexscreener API endpoints...")
+        
+        for i, url in enumerate(DEX_URLS):
+            try:
+                r = requests.get(url, timeout=10)
+                if r.status_code == 200:
+                    data = r.json() or {}
+                    pairs = data.get("pairs") or []
+                    solana_pairs = [p for p in pairs if str(p.get("chainId", "")).lower() == "solana"]
+                    tg_send(f"✅ Endpoint {i+1}: {r.status_code} - {len(pairs)} total, {len(solana_pairs)} Solana")
+                else:
+                    tg_send(f"❌ Endpoint {i+1}: HTTP {r.status_code}")
+            except Exception as e:
+                tg_send(f"❌ Endpoint {i+1}: Error - {str(e)[:50]}")
+        
+        # Test with current fetch function
+        pairs = fetch_pairs()
+        tg_send(f"📊 Final result: {len(pairs)} unique Solana pairs fetched")
     
     elif cmd == "/mememode":
         # Quick setup for optimal meme token sniping
